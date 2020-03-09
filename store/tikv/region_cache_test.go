@@ -23,6 +23,7 @@ import (
 
 	"github.com/google/btree"
 	. "github.com/pingcap/check"
+	"github.com/pingcap/kvproto/pkg/errorpb"
 	"github.com/pingcap/kvproto/pkg/metapb"
 	"github.com/pingcap/tidb/kv"
 	"github.com/pingcap/tidb/store/mockstore/mocktikv"
@@ -744,10 +745,46 @@ func (s *testRegionCacheSuite) TestReplaceAddrWithNewStore(c *C) {
 	s.cluster.UpdateStoreAddr(s.store2, store1Addr)
 	s.cluster.RemoveStore(s.store1)
 	s.cluster.ChangeLeader(s.region1, s.peer2)
-	s.cluster.RemovePeer(s.region1, s.store1)
+	s.cluster.RemovePeer(s.region1, s.peer1)
 
 	getVal, err := client.Get(testKey)
 
+	c.Assert(err, IsNil)
+	c.Assert(getVal, BytesEquals, testValue)
+}
+
+func (s *testRegionCacheSuite) TestReplaceNewAddrAndOldOfflineImmediately(c *C) {
+	mvccStore := mocktikv.MustNewMVCCStore()
+	defer mvccStore.Close()
+
+	client := &RawKVClient{
+		clusterID:   0,
+		regionCache: NewRegionCache(mocktikv.NewPDClient(s.cluster)),
+		rpcClient:   mocktikv.NewRPCClient(s.cluster, mvccStore),
+	}
+	defer client.Close()
+	testKey := []byte("test_key")
+	testValue := []byte("test_value")
+	err := client.Put(testKey, testValue)
+	c.Assert(err, IsNil)
+
+	// pre-load store2's address into cache via follower-read.
+	loc, err := client.regionCache.LocateKey(s.bo, testKey)
+	c.Assert(err, IsNil)
+	fctx, err := client.regionCache.GetTiKVRPCContext(s.bo, loc.Region, kv.ReplicaReadFollower, 0)
+	c.Assert(err, IsNil)
+	c.Assert(fctx.Store.storeID, Equals, s.store2)
+	c.Assert(fctx.Addr, Equals, "store2")
+
+	// make store2 using store1's addr and store1 offline
+	store1Addr := s.storeAddr(s.store1)
+	s.cluster.UpdateStoreAddr(s.store1, s.storeAddr(s.store2))
+	s.cluster.UpdateStoreAddr(s.store2, store1Addr)
+	s.cluster.RemoveStore(s.store1)
+	s.cluster.ChangeLeader(s.region1, s.peer2)
+	s.cluster.RemovePeer(s.region1, s.peer1)
+
+	getVal, err := client.Get(testKey)
 	c.Assert(err, IsNil)
 	c.Assert(getVal, BytesEquals, testValue)
 }
@@ -784,7 +821,7 @@ func (s *testRegionCacheSuite) TestScanRegions(c *C) {
 		s.cluster.Split(regions[i], regions[i+1], []byte{'a' + byte(i)}, peers[i+1], peers[i+1][0])
 	}
 
-	scannedRegions, err := s.cache.scanRegions(s.bo, []byte(""), 100)
+	scannedRegions, err := s.cache.scanRegions(s.bo, []byte(""), nil, 100)
 	c.Assert(err, IsNil)
 	c.Assert(len(scannedRegions), Equals, 5)
 	for i := 0; i < 5; i++ {
@@ -795,7 +832,7 @@ func (s *testRegionCacheSuite) TestScanRegions(c *C) {
 		c.Assert(p.Id, Equals, peers[i][0])
 	}
 
-	scannedRegions, err = s.cache.scanRegions(s.bo, []byte("a"), 3)
+	scannedRegions, err = s.cache.scanRegions(s.bo, []byte("a"), nil, 3)
 	c.Assert(err, IsNil)
 	c.Assert(len(scannedRegions), Equals, 3)
 	for i := 1; i < 4; i++ {
@@ -806,7 +843,7 @@ func (s *testRegionCacheSuite) TestScanRegions(c *C) {
 		c.Assert(p.Id, Equals, peers[i][0])
 	}
 
-	scannedRegions, err = s.cache.scanRegions(s.bo, []byte("a1"), 1)
+	scannedRegions, err = s.cache.scanRegions(s.bo, []byte("a1"), nil, 1)
 	c.Assert(err, IsNil)
 	c.Assert(len(scannedRegions), Equals, 1)
 
@@ -818,7 +855,7 @@ func (s *testRegionCacheSuite) TestScanRegions(c *C) {
 	// Test region with no leader
 	s.cluster.GiveUpLeader(regions[1])
 	s.cluster.GiveUpLeader(regions[3])
-	scannedRegions, err = s.cache.scanRegions(s.bo, []byte(""), 5)
+	scannedRegions, err = s.cache.scanRegions(s.bo, []byte(""), nil, 5)
 	c.Assert(err, IsNil)
 	for i := 0; i < 3; i++ {
 		r := scannedRegions[i]
@@ -843,25 +880,35 @@ func (s *testRegionCacheSuite) TestBatchLoadRegions(c *C) {
 		s.cluster.Split(regions[i], regions[i+1], []byte{'a' + byte(i)}, peers[i+1], peers[i+1][0])
 	}
 
-	key, err := s.cache.BatchLoadRegionsFromKey(s.bo, []byte(""), 1)
-	c.Assert(err, IsNil)
-	c.Assert(key, DeepEquals, []byte("a"))
+	testCases := []struct {
+		startKey      []byte
+		endKey        []byte
+		limit         int
+		expectKey     []byte
+		expectRegions []uint64
+	}{
+		{[]byte(""), []byte("a"), 1, []byte("a"), []uint64{regions[0]}},
+		{[]byte("a"), []byte("b1"), 2, []byte("c"), []uint64{regions[1], regions[2]}},
+		{[]byte("a1"), []byte("d"), 2, []byte("c"), []uint64{regions[1], regions[2]}},
+		{[]byte("c"), []byte("c1"), 2, nil, []uint64{regions[3]}},
+		{[]byte("d"), nil, 2, nil, []uint64{regions[4]}},
+	}
 
-	key, err = s.cache.BatchLoadRegionsFromKey(s.bo, []byte("a"), 2)
-	c.Assert(err, IsNil)
-	c.Assert(key, DeepEquals, []byte("c"))
-
-	key, err = s.cache.BatchLoadRegionsFromKey(s.bo, []byte("a1"), 2)
-	c.Assert(err, IsNil)
-	c.Assert(key, DeepEquals, []byte("c"))
-
-	key, err = s.cache.BatchLoadRegionsFromKey(s.bo, []byte("c"), 2)
-	c.Assert(err, IsNil)
-	c.Assert(len(key), Equals, 0)
-
-	key, err = s.cache.BatchLoadRegionsFromKey(s.bo, []byte("d"), 2)
-	c.Assert(err, IsNil)
-	c.Assert(len(key), Equals, 0)
+	for _, tc := range testCases {
+		key, err := s.cache.BatchLoadRegionsFromKey(s.bo, tc.startKey, tc.limit)
+		c.Assert(err, IsNil)
+		if tc.expectKey != nil {
+			c.Assert(key, DeepEquals, tc.expectKey)
+		} else {
+			c.Assert(key, HasLen, 0)
+		}
+		loadRegions, err := s.cache.BatchLoadRegionsWithKeyRange(s.bo, tc.startKey, tc.endKey, tc.limit)
+		c.Assert(err, IsNil)
+		c.Assert(loadRegions, HasLen, len(tc.expectRegions))
+		for i := range loadRegions {
+			c.Assert(loadRegions[i].GetID(), Equals, tc.expectRegions[i])
+		}
+	}
 
 	s.checkCache(c, len(regions))
 }
@@ -895,6 +942,95 @@ func (s *testRegionCacheSuite) TestFollowerReadFallback(c *C) {
 	ctx, err = s.cache.GetTiKVRPCContext(s.bo, loc.Region, kv.ReplicaReadFollower, 0)
 	c.Assert(err, IsNil)
 	c.Assert(ctx.Peer.Id, Equals, peer3)
+}
+
+func (s *testRegionCacheSuite) TestMixedReadFallback(c *C) {
+	// 3 nodes and no.1 is leader.
+	store3 := s.cluster.AllocID()
+	peer3 := s.cluster.AllocID()
+	s.cluster.AddStore(store3, s.storeAddr(store3))
+	s.cluster.AddPeer(s.region1, store3, peer3)
+	s.cluster.ChangeLeader(s.region1, s.peer1)
+
+	loc, err := s.cache.LocateKey(s.bo, []byte("a"))
+	c.Assert(err, IsNil)
+	ctx, err := s.cache.GetTiKVRPCContext(s.bo, loc.Region, kv.ReplicaReadLeader, 0)
+	c.Assert(err, IsNil)
+	c.Assert(ctx.Peer.Id, Equals, s.peer1)
+	c.Assert(len(ctx.Meta.Peers), Equals, 3)
+
+	// verify follower to be store1, store2 and store3
+	ctxFollower1, err := s.cache.GetTiKVRPCContext(s.bo, loc.Region, kv.ReplicaReadMixed, 0)
+	c.Assert(err, IsNil)
+	c.Assert(ctxFollower1.Peer.Id, Equals, s.peer1)
+
+	ctxFollower2, err := s.cache.GetTiKVRPCContext(s.bo, loc.Region, kv.ReplicaReadMixed, 1)
+	c.Assert(err, IsNil)
+	c.Assert(ctxFollower2.Peer.Id, Equals, s.peer2)
+
+	ctxFollower3, err := s.cache.GetTiKVRPCContext(s.bo, loc.Region, kv.ReplicaReadMixed, 2)
+	c.Assert(err, IsNil)
+	c.Assert(ctxFollower3.Peer.Id, Equals, peer3)
+
+	// send fail on store2, next follower read is going to fallback to store3
+	s.cache.OnSendFail(s.bo, ctxFollower1, false, errors.New("test error"))
+	ctx, err = s.cache.GetTiKVRPCContext(s.bo, loc.Region, kv.ReplicaReadMixed, 0)
+	c.Assert(err, IsNil)
+	c.Assert(ctx.Peer.Id, Equals, s.peer2)
+}
+
+func (s *testRegionCacheSuite) TestFollowerMeetEpochNotMatch(c *C) {
+	// 3 nodes and no.1 is region1 leader.
+	store3 := s.cluster.AllocID()
+	peer3 := s.cluster.AllocID()
+	s.cluster.AddStore(store3, s.storeAddr(store3))
+	s.cluster.AddPeer(s.region1, store3, peer3)
+	s.cluster.ChangeLeader(s.region1, s.peer1)
+
+	// Check the two regions.
+	loc1, err := s.cache.LocateKey(s.bo, []byte("a"))
+	c.Assert(err, IsNil)
+	c.Assert(loc1.Region.id, Equals, s.region1)
+
+	reqSend := NewRegionRequestSender(s.cache, nil)
+
+	// follower read failed on store2
+	followReqSeed := uint32(0)
+	ctxFollower1, err := s.cache.GetTiKVRPCContext(s.bo, loc1.Region, kv.ReplicaReadFollower, followReqSeed)
+	c.Assert(err, IsNil)
+	c.Assert(ctxFollower1.Peer.Id, Equals, s.peer2)
+	c.Assert(ctxFollower1.Store.storeID, Equals, s.store2)
+
+	regionErr := &errorpb.Error{EpochNotMatch: &errorpb.EpochNotMatch{}}
+	reqSend.onRegionError(s.bo, ctxFollower1, &followReqSeed, regionErr)
+	c.Assert(followReqSeed, Equals, uint32(1))
+}
+
+func (s *testRegionCacheSuite) TestMixedMeetEpochNotMatch(c *C) {
+	// 3 nodes and no.1 is region1 leader.
+	store3 := s.cluster.AllocID()
+	peer3 := s.cluster.AllocID()
+	s.cluster.AddStore(store3, s.storeAddr(store3))
+	s.cluster.AddPeer(s.region1, store3, peer3)
+	s.cluster.ChangeLeader(s.region1, s.peer1)
+
+	// Check the two regions.
+	loc1, err := s.cache.LocateKey(s.bo, []byte("a"))
+	c.Assert(err, IsNil)
+	c.Assert(loc1.Region.id, Equals, s.region1)
+
+	reqSend := NewRegionRequestSender(s.cache, nil)
+
+	// follower read failed on store1
+	followReqSeed := uint32(0)
+	ctxFollower1, err := s.cache.GetTiKVRPCContext(s.bo, loc1.Region, kv.ReplicaReadMixed, followReqSeed)
+	c.Assert(err, IsNil)
+	c.Assert(ctxFollower1.Peer.Id, Equals, s.peer1)
+	c.Assert(ctxFollower1.Store.storeID, Equals, s.store1)
+
+	regionErr := &errorpb.Error{EpochNotMatch: &errorpb.EpochNotMatch{}}
+	reqSend.onRegionError(s.bo, ctxFollower1, &followReqSeed, regionErr)
+	c.Assert(followReqSeed, Equals, uint32(1))
 }
 
 func createSampleRegion(startKey, endKey []byte) *Region {

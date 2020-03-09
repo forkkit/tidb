@@ -32,6 +32,7 @@ const (
 	LabelDomain    = "domain"
 	LabelDDLOwner  = "ddl-owner"
 	LabelDDL       = "ddl"
+	LabelDDLWorker = "ddl-worker"
 	LabelDDLSyncer = "ddl-syncer"
 	LabelGCWorker  = "gcworker"
 	LabelAnalyze   = "analyze"
@@ -71,6 +72,7 @@ func RegisterMetrics() {
 	prometheus.MustRegister(CriticalErrorCounter)
 	prometheus.MustRegister(DDLCounter)
 	prometheus.MustRegister(AddIndexTotalCounter)
+	prometheus.MustRegister(AddIndexProgress)
 	prometheus.MustRegister(DDLWorkerHistogram)
 	prometheus.MustRegister(DeploySyncerHistogram)
 	prometheus.MustRegister(DistSQLPartialCountHistogram)
@@ -111,7 +113,7 @@ func RegisterMetrics() {
 	prometheus.MustRegister(StmtNodeCounter)
 	prometheus.MustRegister(DbStmtNodeCounter)
 	prometheus.MustRegister(StoreQueryFeedbackCounter)
-	prometheus.MustRegister(TiKVBackoffCounter)
+	prometheus.MustRegister(GetStoreLimitErrorCounter)
 	prometheus.MustRegister(TiKVBackoffHistogram)
 	prometheus.MustRegister(TiKVCoprocessorHistogram)
 	prometheus.MustRegister(TiKVLoadSafepointCounter)
@@ -122,17 +124,16 @@ func RegisterMetrics() {
 	prometheus.MustRegister(TiKVRegionErrorCounter)
 	prometheus.MustRegister(TiKVSecondaryLockCleanupFailureCounter)
 	prometheus.MustRegister(TiKVSendReqHistogram)
-	prometheus.MustRegister(TiKVSnapshotCounter)
-	prometheus.MustRegister(TiKVTxnCmdCounter)
 	prometheus.MustRegister(TiKVTxnCmdHistogram)
-	prometheus.MustRegister(TiKVTxnCounter)
 	prometheus.MustRegister(TiKVTxnRegionsNumHistogram)
 	prometheus.MustRegister(TiKVTxnWriteKVCountHistogram)
 	prometheus.MustRegister(TiKVTxnWriteSizeHistogram)
 	prometheus.MustRegister(TiKVLocalLatchWaitTimeHistogram)
 	prometheus.MustRegister(TimeJumpBackCounter)
-	prometheus.MustRegister(TransactionCounter)
 	prometheus.MustRegister(TransactionDuration)
+	prometheus.MustRegister(StatementDeadlockDetectDuration)
+	prometheus.MustRegister(StatementPessimisticRetryCount)
+	prometheus.MustRegister(StatementLockKeysCount)
 	prometheus.MustRegister(UpdateSelfVersionHistogram)
 	prometheus.MustRegister(UpdateStatsCounter)
 	prometheus.MustRegister(WatchOwnerCounter)
@@ -147,7 +148,6 @@ func RegisterMetrics() {
 	prometheus.MustRegister(TotalQueryProcHistogram)
 	prometheus.MustRegister(TotalCopProcHistogram)
 	prometheus.MustRegister(TotalCopWaitHistogram)
-	prometheus.MustRegister(CPUUsagePercentageGauge)
 	prometheus.MustRegister(TiKVPendingBatchRequests)
 	prometheus.MustRegister(TiKVBatchWaitDuration)
 	prometheus.MustRegister(TiKVBatchClientUnavailable)
@@ -157,4 +157,5 @@ func RegisterMetrics() {
 	prometheus.MustRegister(TiKVTokenWaitDuration)
 	prometheus.MustRegister(TiKVTxnHeartBeatHistogram)
 	prometheus.MustRegister(GRPCConnTransientFailureCounter)
+	prometheus.MustRegister(TiKVTTLLifeTimeReachCounter)
 }

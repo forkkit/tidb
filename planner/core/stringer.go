@@ -179,6 +179,15 @@ func toString(in Plan, strs []string, idxs []int) ([]string, []int) {
 		str = fmt.Sprintf("IndexReader(%s)", ToString(x.indexPlan))
 	case *PhysicalIndexLookUpReader:
 		str = fmt.Sprintf("IndexLookUp(%s, %s)", ToString(x.indexPlan), ToString(x.tablePlan))
+	case *PhysicalIndexMergeReader:
+		str = "IndexMergeReader(PartialPlans->["
+		for i, paritalPlan := range x.partialPlans {
+			if i > 0 {
+				str += ", "
+			}
+			str += ToString(paritalPlan)
+		}
+		str += "], TablePlan->" + ToString(x.tablePlan) + ")"
 	case *PhysicalUnionScan:
 		str = fmt.Sprintf("UnionScan(%s)", x.Conditions)
 	case *PhysicalIndexJoin:
@@ -245,10 +254,28 @@ func toString(in Plan, strs []string, idxs []int) ([]string, []int) {
 		}
 	case *LogicalWindow:
 		buffer := bytes.NewBufferString("")
-		formatWindowFuncDescs(buffer, x.WindowFuncDescs)
+		formatWindowFuncDescs(buffer, x.WindowFuncDescs, x.schema)
 		str = fmt.Sprintf("Window(%s)", buffer.String())
 	case *PhysicalWindow:
 		str = fmt.Sprintf("Window(%s)", x.ExplainInfo())
+	case *PhysicalShuffle:
+		str = fmt.Sprintf("Partition(%s)", x.ExplainInfo())
+	case *PhysicalShuffleDataSourceStub:
+		str = fmt.Sprintf("PartitionDataSourceStub(%s)", x.ExplainInfo())
+	case *PointGetPlan:
+		str = fmt.Sprintf("PointGet(")
+		if x.IndexInfo != nil {
+			str += fmt.Sprintf("Index(%s.%s)%v)", x.TblInfo.Name.L, x.IndexInfo.Name.L, x.IndexValues)
+		} else {
+			str += fmt.Sprintf("Handle(%s.%s)%v)", x.TblInfo.Name.L, x.TblInfo.GetPkName().L, x.Handle)
+		}
+	case *BatchPointGetPlan:
+		str = fmt.Sprintf("BatchPointGet(")
+		if x.IndexInfo != nil {
+			str += fmt.Sprintf("Index(%s.%s)%v)", x.TblInfo.Name.L, x.IndexInfo.Name.L, x.IndexValues)
+		} else {
+			str += fmt.Sprintf("Handle(%s.%s)%v)", x.TblInfo.Name.L, x.TblInfo.GetPkName().L, x.Handles)
+		}
 	default:
 		str = fmt.Sprintf("%T", in)
 	}

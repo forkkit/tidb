@@ -14,6 +14,7 @@
 package expression
 
 import (
+	"math"
 	"strconv"
 	"strings"
 	"time"
@@ -26,7 +27,7 @@ import (
 	"github.com/pingcap/parser/terror"
 	"github.com/pingcap/tidb/sessionctx"
 	"github.com/pingcap/tidb/types"
-	"github.com/pingcap/tidb/types/parser_driver"
+	driver "github.com/pingcap/tidb/types/parser_driver"
 	"github.com/pingcap/tidb/util/chunk"
 	"github.com/pingcap/tidb/util/logutil"
 	"go.uber.org/zap"
@@ -85,8 +86,30 @@ func FilterOutInPlace(input []Expression, filter func(Expression) bool) (remaine
 	return input, filteredOut
 }
 
+// ExtractDependentColumns extracts all dependent columns from a virtual column.
+func ExtractDependentColumns(expr Expression) []*Column {
+	// Pre-allocate a slice to reduce allocation, 8 doesn't have special meaning.
+	result := make([]*Column, 0, 8)
+	return extractDependentColumns(result, expr)
+}
+
+func extractDependentColumns(result []*Column, expr Expression) []*Column {
+	switch v := expr.(type) {
+	case *Column:
+		result = append(result, v)
+		if v.VirtualExpr != nil {
+			result = extractDependentColumns(result, v.VirtualExpr)
+		}
+	case *ScalarFunction:
+		for _, arg := range v.GetArgs() {
+			result = extractDependentColumns(result, arg)
+		}
+	}
+	return result
+}
+
 // ExtractColumns extracts all columns from an expression.
-func ExtractColumns(expr Expression) (cols []*Column) {
+func ExtractColumns(expr Expression) []*Column {
 	// Pre-allocate a slice to reduce allocation, 8 doesn't have special meaning.
 	result := make([]*Column, 0, 8)
 	return extractColumns(result, expr, nil)
@@ -717,12 +740,17 @@ func IsMutableEffectsExpr(expr Expression) bool {
 }
 
 // RemoveDupExprs removes identical exprs. Not that if expr contains functions which
-// are mutable or have side effects, we cannot remove it even if it has duplicates.
+// are mutable or have side effects, we cannot remove it even if it has duplicates;
+// if the plan is going to be cached, we cannot remove expressions containing `?` neither.
 func RemoveDupExprs(ctx sessionctx.Context, exprs []Expression) []Expression {
 	res := make([]Expression, 0, len(exprs))
 	exists := make(map[string]struct{}, len(exprs))
 	sc := ctx.GetSessionVars().StmtCtx
 	for _, expr := range exprs {
+		if ContainMutableConst(ctx, []Expression{expr}) {
+			res = append(res, expr)
+			continue
+		}
 		key := string(expr.HashCode(sc))
 		if _, ok := exists[key]; !ok || IsMutableEffectsExpr(expr) {
 			res = append(res, expr)
@@ -763,4 +791,140 @@ func GetUint64FromConstant(expr Expression) (uint64, bool, bool) {
 		return dt.GetUint64(), false, true
 	}
 	return 0, false, false
+}
+
+// ContainVirtualColumn checks if the expressions contain a virtual column
+func ContainVirtualColumn(exprs []Expression) bool {
+	for _, expr := range exprs {
+		switch v := expr.(type) {
+		case *Column:
+			if v.VirtualExpr != nil {
+				return true
+			}
+		case *ScalarFunction:
+			if ContainVirtualColumn(v.GetArgs()) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// ContainMutableConst checks if the expressions contain a lazy constant.
+func ContainMutableConst(ctx sessionctx.Context, exprs []Expression) bool {
+	// Treat all constants immutable if plan cache is not enabled for this query.
+	if !ctx.GetSessionVars().StmtCtx.UseCache {
+		return false
+	}
+	for _, expr := range exprs {
+		switch v := expr.(type) {
+		case *Constant:
+			if v.ParamMarker != nil || v.DeferredExpr != nil {
+				return true
+			}
+		case *ScalarFunction:
+			if ContainMutableConst(ctx, v.GetArgs()) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+const (
+	_   = iota
+	kib = 1 << (10 * iota)
+	mib = 1 << (10 * iota)
+	gib = 1 << (10 * iota)
+	tib = 1 << (10 * iota)
+	pib = 1 << (10 * iota)
+	eib = 1 << (10 * iota)
+)
+
+const (
+	nano    = 1
+	micro   = 1000 * nano
+	milli   = 1000 * micro
+	sec     = 1000 * milli
+	min     = 60 * sec
+	hour    = 60 * min
+	dayTime = 24 * hour
+)
+
+// GetFormatBytes convert byte count to value with units.
+func GetFormatBytes(bytes float64) string {
+	var divisor float64
+	var unit string
+
+	bytesAbs := math.Abs(bytes)
+	if bytesAbs >= eib {
+		divisor = eib
+		unit = "EiB"
+	} else if bytesAbs >= pib {
+		divisor = pib
+		unit = "PiB"
+	} else if bytesAbs >= tib {
+		divisor = tib
+		unit = "TiB"
+	} else if bytesAbs >= gib {
+		divisor = gib
+		unit = "GiB"
+	} else if bytesAbs >= mib {
+		divisor = mib
+		unit = "MiB"
+	} else if bytesAbs >= kib {
+		divisor = kib
+		unit = "KiB"
+	} else {
+		divisor = 1
+		unit = "bytes"
+	}
+
+	if divisor == 1 {
+		return strconv.FormatFloat(bytes, 'f', 0, 64) + " " + unit
+	}
+	value := float64(bytes) / divisor
+	if math.Abs(value) >= 100000.0 {
+		return strconv.FormatFloat(value, 'e', 2, 64) + " " + unit
+	}
+	return strconv.FormatFloat(value, 'f', 2, 64) + " " + unit
+}
+
+// GetFormatNanoTime convert time in nanoseconds to value with units.
+func GetFormatNanoTime(time float64) string {
+	var divisor float64
+	var unit string
+
+	timeAbs := math.Abs(time)
+	if timeAbs >= dayTime {
+		divisor = dayTime
+		unit = "d"
+	} else if timeAbs >= hour {
+		divisor = hour
+		unit = "h"
+	} else if timeAbs >= min {
+		divisor = min
+		unit = "min"
+	} else if timeAbs >= sec {
+		divisor = sec
+		unit = "s"
+	} else if timeAbs >= milli {
+		divisor = milli
+		unit = "ms"
+	} else if timeAbs >= micro {
+		divisor = micro
+		unit = "us"
+	} else {
+		divisor = 1
+		unit = "ns"
+	}
+
+	if divisor == 1 {
+		return strconv.FormatFloat(time, 'f', 0, 64) + " " + unit
+	}
+	value := float64(time) / divisor
+	if math.Abs(value) >= 100000.0 {
+		return strconv.FormatFloat(value, 'e', 2, 64) + " " + unit
+	}
+	return strconv.FormatFloat(value, 'f', 2, 64) + " " + unit
 }

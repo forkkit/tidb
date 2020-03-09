@@ -20,6 +20,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	. "github.com/pingcap/check"
 	"github.com/pingcap/parser/auth"
@@ -38,10 +39,12 @@ func TestT(t *testing.T) {
 	logLevel := os.Getenv("log_level")
 	logutil.InitLogger(logutil.NewLogConfig(logLevel, logutil.DefaultLogFormat, "", logutil.EmptyFileLogConfig, false))
 	CustomVerboseFlag = true
+	SetSchemaLease(20 * time.Millisecond)
 	TestingT(t)
 }
 
 var _ = Suite(&testMainSuite{})
+var _ = SerialSuites(&testBootstrapSuite{})
 
 type testMainSuite struct {
 	dbName string
@@ -68,8 +71,8 @@ func (s *testMainSuite) TearDownSuite(c *C) {
 
 func (s *testMainSuite) TestSysSessionPoolGoroutineLeak(c *C) {
 	store, dom := newStoreWithBootstrap(c, s.dbName+"goroutine_leak")
-	defer dom.Close()
 	defer store.Close()
+	defer dom.Close()
 	se, err := createSession(store)
 	c.Assert(err, IsNil)
 

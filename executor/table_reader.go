@@ -16,10 +16,12 @@ package executor
 import (
 	"context"
 	"fmt"
+	"sort"
 
 	"github.com/opentracing/opentracing-go"
 	"github.com/pingcap/parser/model"
 	"github.com/pingcap/tidb/distsql"
+	"github.com/pingcap/tidb/expression"
 	"github.com/pingcap/tidb/kv"
 	plannercore "github.com/pingcap/tidb/planner/core"
 	"github.com/pingcap/tidb/sessionctx"
@@ -60,7 +62,8 @@ type TableReaderExecutor struct {
 	// kvRanges are only use for union scan.
 	kvRanges []kv.KeyRange
 	dagPB    *tipb.DAGRequest
-	// columns are only required by union scan.
+	startTS  uint64
+	// columns are only required by union scan and virtual column.
 	columns []*model.ColumnInfo
 
 	// resultHandler handles the order of the result. Since (MAXInt64, MAXUint64] stores before [0, MaxInt64] physically
@@ -80,6 +83,11 @@ type TableReaderExecutor struct {
 	corColInFilter bool
 	// corColInAccess tells whether there's correlated column in access conditions.
 	corColInAccess bool
+	// virtualColumnIndex records all the indices of virtual columns and sort them in definition
+	// to make sure we can compute the virtual column in right order.
+	virtualColumnIndex []int
+	// virtualColumnRetFieldTypes records the RetFieldTypes of virtual columns.
+	virtualColumnRetFieldTypes []*types.FieldType
 }
 
 // Open initialzes necessary variables for using this executor.
@@ -157,6 +165,27 @@ func (e *TableReaderExecutor) Next(ctx context.Context, req *chunk.Chunk) error 
 		e.feedback.Invalidate()
 		return err
 	}
+
+	virCols := chunk.NewChunkWithCapacity(e.virtualColumnRetFieldTypes, req.Capacity())
+	iter := chunk.NewIterator4Chunk(req)
+
+	for i, idx := range e.virtualColumnIndex {
+		for row := iter.Begin(); row != iter.End(); row = iter.Next() {
+			datum, err := e.schema.Columns[idx].EvalVirtualColumn(row)
+			if err != nil {
+				return err
+			}
+			// Because the expression might return different type from
+			// the generated column, we should wrap a CAST on the result.
+			castDatum, err := table.CastValue(e.ctx, datum, e.columns[idx])
+			if err != nil {
+				return err
+			}
+			virCols.AppendDatum(i, &castDatum)
+		}
+		req.SetCol(idx, virCols.Column(i))
+	}
+
 	return nil
 }
 
@@ -180,6 +209,7 @@ func (e *TableReaderExecutor) buildResp(ctx context.Context, ranges []*ranger.Ra
 	var builder distsql.RequestBuilder
 	kvReq, err := builder.SetTableRanges(getPhysicalTableID(e.table), ranges, e.feedback).
 		SetDAGRequest(e.dagPB).
+		SetStartTS(e.startTS).
 		SetDesc(e.desc).
 		SetKeepOrder(e.keepOrder).
 		SetStreaming(e.streaming).
@@ -197,6 +227,31 @@ func (e *TableReaderExecutor) buildResp(ctx context.Context, ranges []*ranger.Ra
 	}
 	result.Fetch(ctx)
 	return result, nil
+}
+
+func buildVirtualColumnIndex(schema *expression.Schema, columns []*model.ColumnInfo) []int {
+	virtualColumnIndex := make([]int, 0, len(columns))
+	for i, col := range schema.Columns {
+		if col.VirtualExpr != nil {
+			virtualColumnIndex = append(virtualColumnIndex, i)
+		}
+	}
+	sort.Slice(virtualColumnIndex, func(i, j int) bool {
+		return plannercore.FindColumnInfoByID(columns, schema.Columns[virtualColumnIndex[i]].ID).Offset <
+			plannercore.FindColumnInfoByID(columns, schema.Columns[virtualColumnIndex[j]].ID).Offset
+	})
+	return virtualColumnIndex
+}
+
+// buildVirtualColumnInfo saves virtual column indices and sort them in definition order
+func (e *TableReaderExecutor) buildVirtualColumnInfo() {
+	e.virtualColumnIndex = buildVirtualColumnIndex(e.Schema(), e.columns)
+	if len(e.virtualColumnIndex) > 0 {
+		e.virtualColumnRetFieldTypes = make([]*types.FieldType, len(e.virtualColumnIndex))
+		for i, idx := range e.virtualColumnIndex {
+			e.virtualColumnRetFieldTypes[i] = e.schema.Columns[idx].RetType
+		}
+	}
 }
 
 type tableResultHandler struct {

@@ -24,9 +24,11 @@ import (
 	"github.com/pingcap/parser/ast"
 	"github.com/pingcap/parser/model"
 	"github.com/pingcap/parser/terror"
+	"github.com/pingcap/tidb/config"
 	"github.com/pingcap/tidb/kv"
 	"github.com/pingcap/tidb/meta"
 	"github.com/pingcap/tidb/meta/autoid"
+	"github.com/pingcap/tidb/metrics"
 	"github.com/pingcap/tidb/sessionctx"
 	"github.com/pingcap/tidb/store/mockstore"
 	"github.com/pingcap/tidb/types"
@@ -69,6 +71,18 @@ func (d *ddl) generalWorker() *worker {
 // It only starts the original workers.
 func (d *ddl) restartWorkers(ctx context.Context) {
 	d.quitCh = make(chan struct{})
+
+	d.wg.Add(1)
+	go func() {
+		defer d.wg.Done()
+		util.WithRecovery(
+			func() { d.limitDDLJobs() },
+			func(r interface{}) {
+				logutil.BgLogger().Error("[ddl] DDL add batch DDL jobs meet panic",
+					zap.String("ID", d.uuid), zap.Reflect("r", r), zap.Stack("stack trace"))
+				metrics.PanicCounter.WithLabelValues(metrics.LabelDDL).Inc()
+			})
+	}()
 	if !RunWorker {
 		return
 	}
@@ -96,6 +110,15 @@ func TestT(t *testing.T) {
 	logutil.InitLogger(logutil.NewLogConfig(logLevel, "", "", logutil.EmptyFileLogConfig, false))
 	autoid.SetStep(5000)
 	ReorgWaitTimeout = 30 * time.Millisecond
+
+	cfg := config.GetGlobalConfig()
+	newCfg := *cfg
+	// Test for table lock.
+	newCfg.EnableTableLock = true
+	newCfg.Log.SlowThreshold = 10000
+	// Test for add/drop primary key.
+	newCfg.AlterPrimaryKey = true
+	config.StoreGlobalConfig(&newCfg)
 
 	testleak.BeforeTest()
 	TestingT(t)
@@ -176,10 +199,20 @@ func buildCreateIdxJob(dbInfo *model.DBInfo, tblInfo *model.TableInfo, unique bo
 		Type:       model.ActionAddIndex,
 		BinlogInfo: &model.HistoryInfo{},
 		Args: []interface{}{unique, model.NewCIStr(indexName),
-			[]*ast.IndexColName{{
+			[]*ast.IndexPartSpecification{{
 				Column: &ast.ColumnName{Name: model.NewCIStr(colName)},
 				Length: types.UnspecifiedLength}}},
 	}
+}
+
+func testCreatePrimaryKey(c *C, ctx sessionctx.Context, d *ddl, dbInfo *model.DBInfo, tblInfo *model.TableInfo, colName string) *model.Job {
+	job := buildCreateIdxJob(dbInfo, tblInfo, true, "primary", colName)
+	job.Type = model.ActionAddPrimaryKey
+	err := d.doDDLJob(ctx, job)
+	c.Assert(err, IsNil)
+	v := getSchemaVer(c, ctx)
+	checkHistoryJobArgs(c, ctx, job.ID, &historyJobArgs{ver: v, tbl: tblInfo})
+	return job
 }
 
 func testCreateIndex(c *C, ctx sessionctx.Context, d *ddl, dbInfo *model.DBInfo, tblInfo *model.TableInfo, unique bool, indexName string, colName string) *model.Job {
@@ -207,10 +240,14 @@ func testAddColumn(c *C, ctx sessionctx.Context, d *ddl, dbInfo *model.DBInfo, t
 }
 
 func buildDropIdxJob(dbInfo *model.DBInfo, tblInfo *model.TableInfo, indexName string) *model.Job {
+	tp := model.ActionDropIndex
+	if indexName == "primary" {
+		tp = model.ActionDropPrimaryKey
+	}
 	return &model.Job{
 		SchemaID:   dbInfo.ID,
 		TableID:    tblInfo.ID,
-		Type:       model.ActionDropIndex,
+		Type:       tp,
 		BinlogInfo: &model.HistoryInfo{},
 		Args:       []interface{}{model.NewCIStr(indexName)},
 	}

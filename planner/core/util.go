@@ -106,6 +106,16 @@ func (s *logicalSchemaProducer) setSchemaAndNames(schema *expression.Schema, nam
 	s.names = names
 }
 
+// inlineProjection prunes unneeded columns inline a executor.
+func (s *logicalSchemaProducer) inlineProjection(parentUsedCols []*expression.Column) {
+	used := expression.GetUsedList(parentUsedCols, s.schema)
+	for i := len(used) - 1; i >= 0; i-- {
+		if !used[i] {
+			s.schema.Columns = append(s.schema.Columns[:i], s.schema.Columns[i+1:]...)
+		}
+	}
+}
+
 // physicalSchemaProducer stores the schema for the physical plans who can produce schema directly.
 type physicalSchemaProducer struct {
 	schema *expression.Schema
@@ -185,7 +195,8 @@ func buildLogicalJoinSchema(joinType JoinType, join LogicalPlan) *expression.Sch
 	return newSchema
 }
 
-func buildPhysicalJoinSchema(joinType JoinType, join PhysicalPlan) *expression.Schema {
+// BuildPhysicalJoinSchema builds the schema of PhysicalJoin from it's children's schema.
+func BuildPhysicalJoinSchema(joinType JoinType, join PhysicalPlan) *expression.Schema {
 	switch joinType {
 	case SemiJoin, AntiSemiJoin:
 		return join.Children()[0].Schema().Clone()

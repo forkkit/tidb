@@ -530,7 +530,8 @@ func (s *testCodecSuite) TestBytes(c *C) {
 }
 
 func parseTime(c *C, s string) types.Time {
-	m, err := types.ParseTime(nil, s, mysql.TypeDatetime, types.DefaultFsp)
+	sc := &stmtctx.StatementContext{TimeZone: time.UTC}
+	m, err := types.ParseTime(sc, s, mysql.TypeDatetime, types.DefaultFsp)
 	c.Assert(err, IsNil)
 	return m
 }
@@ -557,7 +558,7 @@ func (s *testCodecSuite) TestTime(c *C) {
 		v, err := Decode(b, 1)
 		c.Assert(err, IsNil)
 		var t types.Time
-		t.Type = mysql.TypeDatetime
+		t.SetType(mysql.TypeDatetime)
 		t.FromPackedUint(v[0].GetUint64())
 		c.Assert(types.NewDatum(t), DeepEquals, m)
 	}
@@ -978,10 +979,7 @@ func datumsForTest(sc *stmtctx.StatementContext) ([]types.Datum, []*types.FieldT
 		{[]byte("abc"), types.NewFieldType(mysql.TypeLongBlob)},
 		{types.CurrentTime(mysql.TypeDatetime), types.NewFieldType(mysql.TypeDatetime)},
 		{types.CurrentTime(mysql.TypeDate), types.NewFieldType(mysql.TypeDate)},
-		{types.Time{
-			Time: types.FromGoTime(time.Now()),
-			Type: mysql.TypeTimestamp,
-		}, types.NewFieldType(mysql.TypeTimestamp)},
+		{types.NewTime(types.FromGoTime(time.Now()), mysql.TypeTimestamp, types.DefaultFsp), types.NewFieldType(mysql.TypeTimestamp)},
 		{types.Duration{Duration: time.Second, Fsp: 1}, types.NewFieldType(mysql.TypeDuration)},
 		{types.Enum{Name: "a", Value: 0}, &types.FieldType{Tp: mysql.TypeEnum, Elems: []string{"a"}}},
 		{types.Set{Name: "a", Value: 0}, &types.FieldType{Tp: mysql.TypeSet, Elems: []string{"a"}}},
@@ -1042,17 +1040,17 @@ func testHashChunkRowEqual(c *C, a, b interface{}, equal bool) {
 	buf2 := make([]byte, 1)
 
 	tp1 := new(types.FieldType)
-	types.DefaultTypeForValue(a, tp1)
+	types.DefaultTypeForValue(a, tp1, mysql.DefaultCharset, mysql.DefaultCollationName)
 	chk1 := chunk.New([]*types.FieldType{tp1}, 1, 1)
 	d := types.Datum{}
-	d.SetValue(a)
+	d.SetValue(a, tp1)
 	chk1.AppendDatum(0, &d)
 
 	tp2 := new(types.FieldType)
-	types.DefaultTypeForValue(b, tp2)
+	types.DefaultTypeForValue(b, tp2, mysql.DefaultCharset, mysql.DefaultCollationName)
 	chk2 := chunk.New([]*types.FieldType{tp2}, 1, 1)
 	d = types.Datum{}
-	d.SetValue(b)
+	d.SetValue(b, tp2)
 	chk2.AppendDatum(0, &d)
 
 	h := crc32.NewIEEE()

@@ -35,6 +35,7 @@ import (
 	zaplog "github.com/pingcap/log"
 	"github.com/pingcap/parser/model"
 	"github.com/pingcap/parser/terror"
+	"github.com/pingcap/tidb/ddl"
 	"github.com/pingcap/tidb/domain"
 	"github.com/pingcap/tidb/kv"
 	"github.com/pingcap/tidb/session"
@@ -77,11 +78,10 @@ type server struct {
 }
 
 type TestDDLSuite struct {
-	store     kv.Storage
-	dom       *domain.Domain
-	storePath string
-	s         session.Session
-	ctx       sessionctx.Context
+	store kv.Storage
+	dom   *domain.Domain
+	s     session.Session
+	ctx   sessionctx.Context
 
 	m     sync.Mutex
 	procs []*server
@@ -104,9 +104,8 @@ func (s *TestDDLSuite) SetUpSuite(c *C) {
 	// Make sure the schema lease of this session is equal to other TiDB servers'.
 	session.SetSchemaLease(time.Duration(*lease) * time.Second)
 
-	dom, err := session.BootstrapSession(s.store)
+	s.dom, err = session.BootstrapSession(s.store)
 	c.Assert(err, IsNil)
-	s.dom = dom
 
 	s.s, err = session.CreateSession(s.store)
 	c.Assert(err, IsNil)
@@ -116,13 +115,19 @@ func (s *TestDDLSuite) SetUpSuite(c *C) {
 	_, err = s.s.Execute(goCtx, "create database if not exists test_ddl")
 	c.Assert(err, IsNil)
 
-	_, err = s.s.Execute(goCtx, "use test_ddl")
-	c.Assert(err, IsNil)
-
 	s.Bootstrap(c)
 
 	// Stop current DDL worker, so that we can't be the owner now.
 	err = domain.GetDomain(s.ctx).DDL().Stop()
+	c.Assert(err, IsNil)
+	ddl.RunWorker = false
+	session.ResetStoreForWithTiKVTest(s.store)
+	s.s, err = session.CreateSession(s.store)
+	c.Assert(err, IsNil)
+	s.dom, err = session.BootstrapSession(s.store)
+	c.Assert(err, IsNil)
+	s.ctx = s.s.(sessionctx.Context)
+	_, err = s.s.Execute(goCtx, "use test_ddl")
 	c.Assert(err, IsNil)
 
 	addEnvPath("..")
@@ -256,8 +261,7 @@ func createLogFiles(c *C, length int) {
 }
 
 func (s *TestDDLSuite) startServer(i int, fp *os.File) (*server, error) {
-	var cmd *exec.Cmd
-	cmd = exec.Command("ddltest_tidb-server",
+	cmd := exec.Command("ddltest_tidb-server",
 		"--store=tikv",
 		fmt.Sprintf("-L=%s", *ddlServerLogLevel),
 		fmt.Sprintf("--path=%s%s", *etcd, *tikvPath),
@@ -419,15 +423,6 @@ func (s *TestDDLSuite) query(query string, args ...interface{}) (*sql.Rows, erro
 
 		return r, err
 	}
-}
-
-func (s *TestDDLSuite) mustQuery(c *C, query string, args ...interface{}) *sql.Rows {
-	r, err := s.query(query, args...)
-	if err != nil {
-		log.Fatalf("[mustQuery fail]query - %v %v, error - %v", query, args, err)
-	}
-
-	return r
 }
 
 func (s *TestDDLSuite) getServer() *server {

@@ -18,6 +18,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/pingcap/errors"
 	"github.com/pingcap/kvproto/pkg/metapb"
 	"github.com/pingcap/kvproto/pkg/pdpb"
 	"github.com/pingcap/pd/client"
@@ -45,6 +46,10 @@ func NewPDClient(cluster *Cluster) pd.Client {
 	}
 }
 
+func (c *pdClient) ConfigClient() pd.ConfigClient {
+	return nil
+}
+
 func (c *pdClient) GetClusterID(ctx context.Context) uint64 {
 	return 1
 }
@@ -64,15 +69,20 @@ func (c *pdClient) GetTS(context.Context) (int64, int64, error) {
 }
 
 func (c *pdClient) GetTSAsync(ctx context.Context) pd.TSFuture {
-	return &mockTSFuture{c, ctx}
+	return &mockTSFuture{c, ctx, false}
 }
 
 type mockTSFuture struct {
-	pdc *pdClient
-	ctx context.Context
+	pdc  *pdClient
+	ctx  context.Context
+	used bool
 }
 
 func (m *mockTSFuture) Wait() (int64, int64, error) {
+	if m.used {
+		return 0, 0, errors.New("cannot wait tso twice")
+	}
+	m.used = true
 	return m.pdc.GetTS(m.ctx)
 }
 
@@ -130,3 +140,5 @@ func (c *pdClient) ScatterRegion(ctx context.Context, regionID uint64) error {
 func (c *pdClient) GetOperator(ctx context.Context, regionID uint64) (*pdpb.GetOperatorResponse, error) {
 	return &pdpb.GetOperatorResponse{Status: pdpb.OperatorStatus_SUCCESS}, nil
 }
+
+func (c *pdClient) GetLeaderAddr() string { return "mockpd" }

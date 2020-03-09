@@ -14,6 +14,7 @@
 package chunk
 
 import (
+	"fmt"
 	"math/bits"
 	"reflect"
 	"time"
@@ -37,7 +38,7 @@ func (c *Column) AppendMyDecimal(dec *types.MyDecimal) {
 
 func (c *Column) appendNameValue(name string, val uint64) {
 	var buf [8]byte
-	*(*uint64)(unsafe.Pointer(&buf[0])) = val
+	copy(buf[:], (*[8]byte)(unsafe.Pointer(&val))[:])
 	c.data = append(c.data, buf[:]...)
 	c.data = append(c.data, name...)
 	c.finishAppendVar()
@@ -91,8 +92,31 @@ func (c *Column) isFixed() bool {
 	return c.elemBuf != nil
 }
 
-// Reset resets this Column.
-func (c *Column) Reset() {
+// Reset resets this Column according to the EvalType.
+// Different from reset, Reset will reset the elemBuf.
+func (c *Column) Reset(eType types.EvalType) {
+	switch eType {
+	case types.ETInt:
+		c.ResizeInt64(0, false)
+	case types.ETReal:
+		c.ResizeFloat64(0, false)
+	case types.ETDecimal:
+		c.ResizeDecimal(0, false)
+	case types.ETString:
+		c.ReserveString(0)
+	case types.ETDatetime, types.ETTimestamp:
+		c.ResizeTime(0, false)
+	case types.ETDuration:
+		c.ResizeGoDuration(0, false)
+	case types.ETJson:
+		c.ReserveJSON(0)
+	default:
+		panic(fmt.Sprintf("invalid EvalType %v", eType))
+	}
+}
+
+// reset resets the underlying data of this Column but doesn't modify its data type.
+func (c *Column) reset() {
 	c.length = 0
 	c.nullBitmap = c.nullBitmap[:0]
 	if len(c.offsets) > 0 {
@@ -240,7 +264,7 @@ const (
 	sizeFloat64    = int(unsafe.Sizeof(float64(0)))
 	sizeMyDecimal  = int(unsafe.Sizeof(types.MyDecimal{}))
 	sizeGoDuration = int(unsafe.Sizeof(time.Duration(0)))
-	sizeTime       = int(unsafe.Sizeof(types.Time{}))
+	sizeTime       = int(unsafe.Sizeof(types.ZeroTime))
 )
 
 var (
@@ -270,7 +294,7 @@ func (c *Column) resize(n, typeSize int, isNull bool) {
 		newNulls = true
 	}
 	if !isNull || !newNulls {
-		var nullVal byte = 0
+		var nullVal byte
 		if !isNull {
 			nullVal = 0xFF
 		}
@@ -543,7 +567,9 @@ func (c *Column) getNameValue(rowID int) (string, uint64) {
 	if start == end {
 		return "", 0
 	}
-	return string(hack.String(c.data[start+8 : end])), *(*uint64)(unsafe.Pointer(&c.data[start]))
+	var val uint64
+	copy((*[8]byte)(unsafe.Pointer(&val))[:], c.data[start:])
+	return string(hack.String(c.data[start+8 : end])), val
 }
 
 // GetRaw returns the underlying raw bytes in the specific row.
@@ -639,7 +665,7 @@ func (c *Column) CopyReconstruct(sel []int, dst *Column) *Column {
 	if dst == nil {
 		dst = newColumn(c.typeSize(), len(sel))
 	} else {
-		dst.Reset()
+		dst.reset()
 	}
 
 	if c.isFixed() {

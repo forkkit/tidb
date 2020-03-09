@@ -23,6 +23,7 @@ import (
 
 	. "github.com/pingcap/check"
 	"github.com/pingcap/errors"
+	"github.com/pingcap/failpoint"
 	"github.com/pingcap/log"
 	"github.com/pingcap/parser"
 	"github.com/pingcap/parser/ast"
@@ -37,24 +38,35 @@ import (
 	"github.com/pingcap/tidb/sessionctx"
 	"github.com/pingcap/tidb/store/mockstore"
 	"github.com/pingcap/tidb/util/admin"
+	"github.com/pingcap/tidb/util/gcutil"
 	"github.com/pingcap/tidb/util/sqlexec"
 	"github.com/pingcap/tidb/util/testkit"
 	"go.uber.org/zap"
 )
 
 var _ = Suite(&testStateChangeSuite{})
+var _ = SerialSuites(&serialTestStateChangeSuite{})
 
-type testStateChangeSuite struct {
-	lease time.Duration
-	store kv.Storage
-	dom   *domain.Domain
-	se    session.Session
-	p     *parser.Parser
+type serialTestStateChangeSuite struct {
+	testStateChangeSuiteBase
 }
 
-func (s *testStateChangeSuite) SetUpSuite(c *C) {
+type testStateChangeSuite struct {
+	testStateChangeSuiteBase
+}
+
+type testStateChangeSuiteBase struct {
+	lease  time.Duration
+	store  kv.Storage
+	dom    *domain.Domain
+	se     session.Session
+	p      *parser.Parser
+	preSQL string
+}
+
+func (s *testStateChangeSuiteBase) SetUpSuite(c *C) {
 	s.lease = 200 * time.Millisecond
-	ddl.WaitTimeWhenErrorOccured = 1 * time.Microsecond
+	ddl.SetWaitTimeWhenErrorOccurred(1 * time.Microsecond)
 	var err error
 	s.store, err = mockstore.NewMockTikvStore()
 	c.Assert(err, IsNil)
@@ -70,7 +82,7 @@ func (s *testStateChangeSuite) SetUpSuite(c *C) {
 	s.p = parser.New()
 }
 
-func (s *testStateChangeSuite) TearDownSuite(c *C) {
+func (s *testStateChangeSuiteBase) TearDownSuite(c *C) {
 	s.se.Execute(context.Background(), "drop database if exists test_db_state")
 	s.se.Close()
 	s.dom.Close()
@@ -83,6 +95,10 @@ func (s *testStateChangeSuite) TestShowCreateTable(c *C) {
 	tk.MustExec("use test")
 	tk.MustExec("create table t (id int)")
 	tk.MustExec("create table t2 (a int, b varchar(10)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci")
+	// tkInternal is used to execute additional sql (here show create table) in ddl change callback.
+	// Using same `tk` in different goroutines may lead to data race.
+	tkInternal := testkit.NewTestKit(c, s.store)
+	tkInternal.MustExec("use test")
 
 	var checkErr error
 	testCases := []struct {
@@ -111,14 +127,26 @@ func (s *testStateChangeSuite) TestShowCreateTable(c *C) {
 			currTestCaseOffset++
 		}
 		if job.SchemaState != model.StatePublic {
-			var result *testkit.Result
-			tbl2 := testGetTableByName(c, tk.Se, "test", "t2")
+			var result sqlexec.RecordSet
+			tbl2 := testGetTableByName(c, tkInternal.Se, "test", "t2")
 			if job.TableID == tbl2.Meta().ID {
-				result = tk.MustQuery("show create table t2")
+				// Try to do not use mustQuery in hook func, cause assert fail in mustQuery will cause ddl job hung.
+				result, checkErr = tkInternal.Exec("show create table t2")
+				if checkErr != nil {
+					return
+				}
 			} else {
-				result = tk.MustQuery("show create table t")
+				result, checkErr = tkInternal.Exec("show create table t")
+				if checkErr != nil {
+					return
+				}
 			}
-			got := result.Rows()[0][1]
+			req := result.NewChunk()
+			checkErr = result.Next(context.Background(), req)
+			if checkErr != nil {
+				return
+			}
+			got := req.GetRow(0).GetString(1)
 			expected := testCases[currTestCaseOffset].expectedRet
 			if got != expected {
 				checkErr = errors.Errorf("got %s, expected %s", got, expected)
@@ -209,14 +237,14 @@ func (s *testStateChangeSuite) TestTwoStates(c *C) {
 	// Fill the SQLs and expected error messages.
 	testInfo.sqlInfos[0].sql = "insert into t (c1, c2, c3, c4) value(2, 'b', 'N', '2017-07-02')"
 	testInfo.sqlInfos[1].sql = "insert into t (c1, c2, c3, d3, c4) value(3, 'b', 'N', 'a', '2017-07-03')"
-	unknownColErr := errors.New("unknown column d3")
+	unknownColErr := "[planner:1054]Unknown column 'd3' in 'field list'"
 	testInfo.sqlInfos[1].cases[0].expectedCompileErr = unknownColErr
 	testInfo.sqlInfos[1].cases[1].expectedCompileErr = unknownColErr
 	testInfo.sqlInfos[1].cases[2].expectedCompileErr = unknownColErr
 	testInfo.sqlInfos[1].cases[3].expectedCompileErr = unknownColErr
 	testInfo.sqlInfos[2].sql = "update t set c2 = 'c2_update'"
 	testInfo.sqlInfos[3].sql = "replace into t values(5, 'e', 'N', '2017-07-05')"
-	testInfo.sqlInfos[3].cases[4].expectedCompileErr = errors.New("Column count doesn't match value count at row 1")
+	testInfo.sqlInfos[3].cases[4].expectedCompileErr = "[planner:1136]Column count doesn't match value count at row 1"
 	alterTableSQL := "alter table t add column d3 enum('a', 'b') not null default 'a' after c3"
 	s.test(c, "", alterTableSQL, testInfo)
 	// TODO: Add more DDL statements.
@@ -308,8 +336,8 @@ type stateCase struct {
 	session            session.Session
 	rawStmt            ast.StmtNode
 	stmt               sqlexec.Statement
-	expectedExecErr    error
-	expectedCompileErr error
+	expectedExecErr    string
+	expectedCompileErr string
 }
 
 type sqlInfo struct {
@@ -378,10 +406,10 @@ func (t *testExecInfo) compileSQL(idx int) (err error) {
 			return errors.Trace(err)
 		}
 		c.stmt, err = compiler.Compile(ctx, c.rawStmt)
-		if c.expectedCompileErr != nil {
+		if c.expectedCompileErr != "" {
 			if err == nil {
 				err = errors.Errorf("expected error %s but got nil", c.expectedCompileErr)
-			} else if strings.Contains(err.Error(), c.expectedCompileErr.Error()) {
+			} else if err.Error() == c.expectedCompileErr {
 				err = nil
 			}
 		}
@@ -395,14 +423,14 @@ func (t *testExecInfo) compileSQL(idx int) (err error) {
 func (t *testExecInfo) execSQL(idx int) error {
 	for _, sqlInfo := range t.sqlInfos {
 		c := sqlInfo.cases[idx]
-		if c.expectedCompileErr != nil {
+		if c.expectedCompileErr != "" {
 			continue
 		}
 		_, err := c.stmt.Exec(context.TODO())
-		if c.expectedExecErr != nil {
+		if c.expectedExecErr != "" {
 			if err == nil {
 				err = errors.Errorf("expected error %s but got nil", c.expectedExecErr)
-			} else if strings.Contains(err.Error(), c.expectedExecErr.Error()) {
+			} else if err.Error() == c.expectedExecErr {
 				err = nil
 			}
 		}
@@ -453,7 +481,7 @@ func (s *testStateChangeSuite) TestAppendEnum(c *C) {
 	c.Assert(err.Error(), Equals, "[ddl:8200]Unsupported modify column: the number of enum column's elements is less than the original: 2")
 	failAlterTableSQL2 := "alter table t change c2 c2 int default 0"
 	_, err = s.se.Execute(context.Background(), failAlterTableSQL2)
-	c.Assert(err.Error(), Equals, "[ddl:8200]Unsupported modify charset from utf8 to binary")
+	c.Assert(err.Error(), Equals, "[ddl:8200]Unsupported modify column: cannot modify enum type column's to type int(11)")
 	alterTableSQL := "alter table t change c2 c2 enum('N','Y','A') DEFAULT 'A'"
 	_, err = s.se.Execute(context.Background(), alterTableSQL)
 	c.Assert(err, IsNil)
@@ -517,7 +545,7 @@ func (s *testStateChangeSuite) TestDeleteOnly(c *C) {
 	s.runTestInSchemaState(c, model.StateDeleteOnly, "", dropColumnSQL, sqls, nil)
 }
 
-func (s *testStateChangeSuite) runTestInSchemaState(c *C, state model.SchemaState, tableName, alterTableSQL string,
+func (s *testStateChangeSuiteBase) runTestInSchemaState(c *C, state model.SchemaState, tableName, alterTableSQL string,
 	sqlWithErrs []sqlWithErr, expectQuery *expectQuery) {
 	_, err := s.se.Execute(context.Background(), `create table t (
 		c1 varchar(64),
@@ -575,7 +603,7 @@ func (s *testStateChangeSuite) runTestInSchemaState(c *C, state model.SchemaStat
 	}
 }
 
-func (s *testStateChangeSuite) execQuery(tk *testkit.TestKit, sql string, args ...interface{}) (*testkit.Result, error) {
+func (s *testStateChangeSuiteBase) execQuery(tk *testkit.TestKit, sql string, args ...interface{}) (*testkit.Result, error) {
 	comment := Commentf("sql:%s, args:%v", sql, args)
 	rs, err := tk.Exec(sql, args...)
 	if err != nil {
@@ -594,7 +622,7 @@ func checkResult(result *testkit.Result, expected [][]interface{}) error {
 	return nil
 }
 
-func (s *testStateChangeSuite) CheckResult(tk *testkit.TestKit, sql string, args ...interface{}) (*testkit.Result, error) {
+func (s *testStateChangeSuiteBase) CheckResult(tk *testkit.TestKit, sql string, args ...interface{}) (*testkit.Result, error) {
 	comment := Commentf("sql:%s, args:%v", sql, args)
 	rs, err := tk.Exec(sql, args...)
 	if err != nil {
@@ -626,7 +654,7 @@ func (s *testStateChangeSuite) TestShowIndex(c *C) {
 				checkErr = err1
 				break
 			}
-			checkErr = checkResult(result, testkit.Rows("t 0 PRIMARY 1 c1 A 0 <nil> <nil>  BTREE  "))
+			checkErr = checkResult(result, testkit.Rows("t 0 PRIMARY 1 c1 A 0 <nil> <nil>  BTREE   NULL"))
 		}
 	}
 
@@ -640,14 +668,14 @@ func (s *testStateChangeSuite) TestShowIndex(c *C) {
 
 	result, err := s.execQuery(tk, showIndexSQL)
 	c.Assert(err, IsNil)
-	err = checkResult(result, testkit.Rows("t 0 PRIMARY 1 c1 A 0 <nil> <nil>  BTREE  ", "t 1 c2 1 c2 A 0 <nil> <nil> YES BTREE  "))
+	err = checkResult(result, testkit.Rows("t 0 PRIMARY 1 c1 A 0 <nil> <nil>  BTREE   NULL", "t 1 c2 1 c2 A 0 <nil> <nil> YES BTREE   NULL"))
 	c.Assert(err, IsNil)
 	d.(ddl.DDLForTest).SetHook(originalCallback)
 
 	c.Assert(err, IsNil)
 
 	_, err = s.se.Execute(context.Background(), `create table tr(
-		id int, name varchar(50), 
+		id int, name varchar(50),
 		purchased date
 	)
 	partition by range( year(purchased) ) (
@@ -664,7 +692,7 @@ func (s *testStateChangeSuite) TestShowIndex(c *C) {
 	c.Assert(err, IsNil)
 	result, err = s.execQuery(tk, "show index from tr;")
 	c.Assert(err, IsNil)
-	err = checkResult(result, testkit.Rows("tr 1 idx1 1 purchased A 0 <nil> <nil> YES BTREE  "))
+	err = checkResult(result, testkit.Rows("tr 1 idx1 1 purchased A 0 <nil> <nil> YES BTREE   NULL"))
 	c.Assert(err, IsNil)
 }
 
@@ -745,6 +773,26 @@ func (s *testStateChangeSuite) TestParallelAlterAddIndex(c *C) {
 	s.testControlParallelExecSQL(c, sql1, sql2, f)
 }
 
+func (s *testStateChangeSuite) TestParallelAlterAddExpressionIndex(c *C) {
+	sql1 := "ALTER TABLE t add index expr_index_b((b+1));"
+	sql2 := "CREATE INDEX expr_index_b ON t ((c+1));"
+	f := func(c *C, err1, err2 error) {
+		c.Assert(err1, IsNil)
+		c.Assert(err2.Error(), Equals, "[ddl:1061]index already exist expr_index_b")
+	}
+	s.testControlParallelExecSQL(c, sql1, sql2, f)
+}
+
+func (s *testStateChangeSuite) TestParallelAddPrimaryKey(c *C) {
+	sql1 := "ALTER TABLE t add primary key index_b(b);"
+	sql2 := "ALTER TABLE t add primary key index_b(c);"
+	f := func(c *C, err1, err2 error) {
+		c.Assert(err1, IsNil)
+		c.Assert(err2.Error(), Equals, "[schema:1068]Multiple primary key defined")
+	}
+	s.testControlParallelExecSQL(c, sql1, sql2, f)
+}
+
 func (s *testStateChangeSuite) TestParallelAlterAddPartition(c *C) {
 	sql1 := `alter table t_part add partition (
     partition p2 values less than (30)
@@ -775,6 +823,20 @@ func (s *testStateChangeSuite) TestParallelDropIndex(c *C) {
 	s.testControlParallelExecSQL(c, sql1, sql2, f)
 }
 
+func (s *testStateChangeSuite) TestParallelDropPrimaryKey(c *C) {
+	s.preSQL = "ALTER TABLE t add primary key index_b(c);"
+	defer func() {
+		s.preSQL = ""
+	}()
+	sql1 := "alter table t drop primary key;"
+	sql2 := "alter table t drop primary key;"
+	f := func(c *C, err1, err2 error) {
+		c.Assert(err1, IsNil)
+		c.Assert(err2.Error(), Equals, "[ddl:1091]index PRIMARY doesn't exist")
+	}
+	s.testControlParallelExecSQL(c, sql1, sql2, f)
+}
+
 func (s *testStateChangeSuite) TestParallelCreateAndRename(c *C) {
 	sql1 := "create table t_exists(c int);"
 	sql2 := "alter table t rename to t_exists;"
@@ -788,21 +850,7 @@ func (s *testStateChangeSuite) TestParallelCreateAndRename(c *C) {
 
 type checkRet func(c *C, err1, err2 error)
 
-func (s *testStateChangeSuite) testControlParallelExecSQL(c *C, sql1, sql2 string, f checkRet) {
-	_, err := s.se.Execute(context.Background(), "use test_db_state")
-	c.Assert(err, IsNil)
-	_, err = s.se.Execute(context.Background(), "create table t(a int, b int, c int, d int auto_increment,e int, index idx1(d), index idx2(d,e))")
-	c.Assert(err, IsNil)
-	defer s.se.Execute(context.Background(), "drop table t")
-
-	_, err = s.se.Execute(context.Background(), "drop database if exists t_part")
-	c.Assert(err, IsNil)
-	s.se.Execute(context.Background(), `create table t_part (a int key)
-	 partition by range(a) (
-	 partition p0 values less than (10),
-	 partition p1 values less than (20)
-	 );`)
-
+func (s *testStateChangeSuiteBase) prepareTestControlParallelExecSQL(c *C) (session.Session, session.Session, chan struct{}, ddl.Callback) {
 	callback := &ddl.TestDDLCallback{}
 	times := 0
 	callback.OnJobUpdatedExported = func(job *model.Job) {
@@ -828,12 +876,8 @@ func (s *testStateChangeSuite) testControlParallelExecSQL(c *C, sql1, sql2 strin
 	}
 	d := s.dom.DDL()
 	originalCallback := d.GetHook()
-	defer d.(ddl.DDLForTest).SetHook(originalCallback)
 	d.(ddl.DDLForTest).SetHook(callback)
 
-	wg := sync.WaitGroup{}
-	var err1 error
-	var err2 error
 	se, err := session.CreateSession(s.store)
 	c.Assert(err, IsNil)
 	_, err = se.Execute(context.Background(), "use test_db_state")
@@ -842,7 +886,6 @@ func (s *testStateChangeSuite) testControlParallelExecSQL(c *C, sql1, sql2 strin
 	c.Assert(err, IsNil)
 	_, err = se1.Execute(context.Background(), "use test_db_state")
 	c.Assert(err, IsNil)
-	wg.Add(2)
 	ch := make(chan struct{})
 	// Make sure the sql1 is put into the DDLJobQueue.
 	go func() {
@@ -864,6 +907,35 @@ func (s *testStateChangeSuite) testControlParallelExecSQL(c *C, sql1, sql2 strin
 			time.Sleep(5 * time.Millisecond)
 		}
 	}()
+	return se, se1, ch, originalCallback
+}
+
+func (s *testStateChangeSuiteBase) testControlParallelExecSQL(c *C, sql1, sql2 string, f checkRet) {
+	_, err := s.se.Execute(context.Background(), "use test_db_state")
+	c.Assert(err, IsNil)
+	_, err = s.se.Execute(context.Background(), "create table t(a int, b int, c int, d int auto_increment,e int, index idx1(d), index idx2(d,e))")
+	c.Assert(err, IsNil)
+	if len(s.preSQL) != 0 {
+		_, err := s.se.Execute(context.Background(), s.preSQL)
+		c.Assert(err, IsNil)
+	}
+	defer s.se.Execute(context.Background(), "drop table t")
+
+	_, err = s.se.Execute(context.Background(), "drop database if exists t_part")
+	c.Assert(err, IsNil)
+	s.se.Execute(context.Background(), `create table t_part (a int key)
+	 partition by range(a) (
+	 partition p0 values less than (10),
+	 partition p1 values less than (20)
+	 );`)
+
+	se, se1, ch, originalCallback := s.prepareTestControlParallelExecSQL(c)
+	defer s.dom.DDL().(ddl.DDLForTest).SetHook(originalCallback)
+
+	var err1 error
+	var err2 error
+	wg := sync.WaitGroup{}
+	wg.Add(2)
 	go func() {
 		defer wg.Done()
 		_, err1 = se.Execute(context.Background(), sql1)
@@ -876,6 +948,42 @@ func (s *testStateChangeSuite) testControlParallelExecSQL(c *C, sql1, sql2 strin
 
 	wg.Wait()
 	f(c, err1, err2)
+}
+
+func (s *testStateChangeSuite) TestParallelUpdateTableReplica(c *C) {
+	ctx := context.Background()
+	_, err := s.se.Execute(context.Background(), "use test_db_state")
+	c.Assert(err, IsNil)
+	_, err = s.se.Execute(ctx, "drop table if exists t1;")
+	c.Assert(err, IsNil)
+	_, err = s.se.Execute(ctx, "create table t1 (a int);")
+	c.Assert(err, IsNil)
+	_, err = s.se.Execute(ctx, "alter table t1 set tiflash replica 3 location labels 'a','b';")
+	c.Assert(err, IsNil)
+
+	se, se1, ch, originalCallback := s.prepareTestControlParallelExecSQL(c)
+	defer s.dom.DDL().(ddl.DDLForTest).SetHook(originalCallback)
+
+	t1 := testGetTableByName(c, se, "test_db_state", "t1")
+
+	var err1 error
+	var err2 error
+	wg := sync.WaitGroup{}
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		// Mock for table tiflash replica was available.
+		err1 = domain.GetDomain(se).DDL().UpdateTableReplicaInfo(se, t1.Meta().ID, true)
+	}()
+	go func() {
+		defer wg.Done()
+		<-ch
+		// Mock for table tiflash replica was available.
+		err2 = domain.GetDomain(se1).DDL().UpdateTableReplicaInfo(se1, t1.Meta().ID, true)
+	}()
+	wg.Wait()
+	c.Assert(err1, IsNil)
+	c.Assert(err2.Error(), Equals, "[ddl:-1]the replica available status of table t1 is already updated")
 }
 
 func (s *testStateChangeSuite) testParallelExecSQL(c *C, sql string) {
@@ -1090,4 +1198,49 @@ func (s *testStateChangeSuite) TestParallelTruncateTableAndAddColumn(c *C) {
 		c.Assert(err2.Error(), Equals, "[domain:8028]Information schema is changed during the execution of the statement(for example, table definition may be updated by other DDL ran in parallel). If you see this error often, try increasing `tidb_max_delta_schema_count`. [try again later]")
 	}
 	s.testControlParallelExecSQL(c, sql1, sql2, f)
+}
+
+// TestParallelFlashbackTable tests parallel flashback table.
+func (s *serialTestStateChangeSuite) TestParallelFlashbackTable(c *C) {
+	c.Assert(failpoint.Enable("github.com/pingcap/tidb/meta/autoid/mockAutoIDChange", `return(true)`), IsNil)
+	defer func(originGC bool) {
+		c.Assert(failpoint.Disable("github.com/pingcap/tidb/meta/autoid/mockAutoIDChange"), IsNil)
+		if originGC {
+			ddl.EmulatorGCEnable()
+		} else {
+			ddl.EmulatorGCDisable()
+		}
+	}(ddl.IsEmulatorGCEnable())
+
+	// disable emulator GC.
+	// Disable emulator GC, otherwise, emulator GC will delete table record as soon as possible after executing drop table DDL.
+	ddl.EmulatorGCDisable()
+	gcTimeFormat := "20060102-15:04:05 -0700 MST"
+	timeBeforeDrop := time.Now().Add(0 - time.Duration(48*60*60*time.Second)).Format(gcTimeFormat)
+	safePointSQL := `INSERT HIGH_PRIORITY INTO mysql.tidb VALUES ('tikv_gc_safe_point', '%[1]s', '')
+			       ON DUPLICATE KEY
+			       UPDATE variable_value = '%[1]s'`
+	tk := testkit.NewTestKit(c, s.store)
+	// clear GC variables first.
+	tk.MustExec("delete from mysql.tidb where variable_name in ( 'tikv_gc_safe_point','tikv_gc_enable' )")
+	// set GC safe point
+	tk.MustExec(fmt.Sprintf(safePointSQL, timeBeforeDrop))
+	// set GC enable.
+	err := gcutil.EnableGC(tk.Se)
+	c.Assert(err, IsNil)
+
+	// prepare dropped table.
+	tk.MustExec("use test_db_state")
+	tk.MustExec("drop table if exists t")
+	tk.MustExec("create table t (a int);")
+	tk.MustExec("drop table if exists t")
+	// Test parallel flashback table.
+	sql1 := "flashback table t to t_flashback"
+	f := func(c *C, err1, err2 error) {
+		c.Assert(err1, IsNil)
+		c.Assert(err2, NotNil)
+		c.Assert(err2.Error(), Equals, "[schema:1050]Table 't_flashback' already exists")
+
+	}
+	s.testControlParallelExecSQL(c, sql1, sql1, f)
 }

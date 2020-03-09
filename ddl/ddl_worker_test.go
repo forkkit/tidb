@@ -34,13 +34,15 @@ import (
 )
 
 var _ = Suite(&testDDLSuite{})
+var _ = Suite(&testDDLSerialSuite{})
 
 type testDDLSuite struct{}
+type testDDLSerialSuite struct{}
 
 const testLease = 5 * time.Millisecond
 
-func (s *testDDLSuite) SetUpSuite(c *C) {
-	WaitTimeWhenErrorOccured = 1 * time.Microsecond
+func (s *testDDLSerialSuite) SetUpSuite(c *C) {
+	SetWaitTimeWhenErrorOccurred(1 * time.Microsecond)
 
 	// We hope that this test is serially executed. So put it here.
 	s.testRunWorker(c)
@@ -66,7 +68,7 @@ func (s *testDDLSuite) TestCheckOwner(c *C) {
 }
 
 // testRunWorker tests no job is handled when the value of RunWorker is false.
-func (s *testDDLSuite) testRunWorker(c *C) {
+func (s *testDDLSerialSuite) testRunWorker(c *C) {
 	store := testCreateStore(c, "test_run_worker")
 	defer store.Close()
 
@@ -252,14 +254,14 @@ func (s *testDDLSuite) TestIndexError(c *C) {
 	doDDLJobErr(c, dbInfo.ID, tblInfo.ID, model.ActionAddIndex, []interface{}{1}, ctx, d)
 	doDDLJobErr(c, dbInfo.ID, tblInfo.ID, model.ActionAddIndex,
 		[]interface{}{false, model.NewCIStr("t"), 1,
-			[]*ast.IndexColName{{Column: &ast.ColumnName{Name: model.NewCIStr("c")}, Length: 256}}}, ctx, d)
+			[]*ast.IndexPartSpecification{{Column: &ast.ColumnName{Name: model.NewCIStr("c")}, Length: 256}}}, ctx, d)
 	doDDLJobErr(c, dbInfo.ID, tblInfo.ID, model.ActionAddIndex,
 		[]interface{}{false, model.NewCIStr("c1_index"), 1,
-			[]*ast.IndexColName{{Column: &ast.ColumnName{Name: model.NewCIStr("c")}, Length: 256}}}, ctx, d)
+			[]*ast.IndexPartSpecification{{Column: &ast.ColumnName{Name: model.NewCIStr("c")}, Length: 256}}}, ctx, d)
 	testCreateIndex(c, ctx, d, dbInfo, tblInfo, false, "c1_index", "c1")
 	doDDLJobErr(c, dbInfo.ID, tblInfo.ID, model.ActionAddIndex,
 		[]interface{}{false, model.NewCIStr("c1_index"), 1,
-			[]*ast.IndexColName{{Column: &ast.ColumnName{Name: model.NewCIStr("c1")}, Length: 256}}}, ctx, d)
+			[]*ast.IndexPartSpecification{{Column: &ast.ColumnName{Name: model.NewCIStr("c1")}, Length: 256}}}, ctx, d)
 
 	// for dropping index
 	doDDLJobErr(c, dbInfo.ID, tblInfo.ID, model.ActionDropIndex, []interface{}{1}, ctx, d)
@@ -374,10 +376,11 @@ func doDDLJobErr(c *C, schemaID, tableID int64, tp model.ActionType, args []inte
 
 func checkCancelState(txn kv.Transaction, job *model.Job, test *testCancelJob) error {
 	var checkErr error
-	addIndexFirstReorg := test.act == model.ActionAddIndex && job.SchemaState == model.StateWriteReorganization && job.SnapshotVer == 0
+	addIndexFirstReorg := (test.act == model.ActionAddIndex || test.act == model.ActionAddPrimaryKey) &&
+		job.SchemaState == model.StateWriteReorganization && job.SnapshotVer == 0
 	// If the action is adding index and the state is writing reorganization, it wants to test the case of cancelling the job when backfilling indexes.
 	// When the job satisfies this case of addIndexFirstReorg, the worker hasn't started to backfill indexes.
-	if test.cancelState == job.SchemaState && !addIndexFirstReorg {
+	if test.cancelState == job.SchemaState && !addIndexFirstReorg && !job.IsRollingback() {
 		errs, err := admin.CancelJobs(txn, test.jobIDs)
 		if err != nil {
 			checkErr = errors.Trace(err)
@@ -439,12 +442,27 @@ func buildCancelJobTests(firstID int64) []testCancelJob {
 		{act: model.ActionTruncateTablePartition, jobIDs: []int64{firstID + 28}, cancelRetErrs: []error{admin.ErrCancelFinishedDDLJob.GenWithStackByArgs(firstID + 28)}, cancelState: model.StatePublic},
 		{act: model.ActionModifySchemaCharsetAndCollate, jobIDs: []int64{firstID + 30}, cancelRetErrs: noErrs, cancelState: model.StateNone},
 		{act: model.ActionModifySchemaCharsetAndCollate, jobIDs: []int64{firstID + 31}, cancelRetErrs: []error{admin.ErrCancelFinishedDDLJob.GenWithStackByArgs(firstID + 31)}, cancelState: model.StatePublic},
+
+		{act: model.ActionAddPrimaryKey, jobIDs: []int64{firstID + 32}, cancelRetErrs: noErrs, cancelState: model.StateDeleteOnly},
+		{act: model.ActionAddPrimaryKey, jobIDs: []int64{firstID + 33}, cancelRetErrs: noErrs, cancelState: model.StateWriteOnly},
+		{act: model.ActionAddPrimaryKey, jobIDs: []int64{firstID + 34}, cancelRetErrs: noErrs, cancelState: model.StateWriteReorganization},
+		{act: model.ActionAddPrimaryKey, jobIDs: []int64{firstID + 35}, cancelRetErrs: []error{admin.ErrCancelFinishedDDLJob.GenWithStackByArgs(firstID + 35)}, cancelState: model.StatePublic},
+		{act: model.ActionDropPrimaryKey, jobIDs: []int64{firstID + 36}, cancelRetErrs: noErrs, cancelState: model.StateWriteOnly},
+		{act: model.ActionDropPrimaryKey, jobIDs: []int64{firstID + 37}, cancelRetErrs: []error{admin.ErrCannotCancelDDLJob.GenWithStackByArgs(firstID + 37)}, cancelState: model.StateDeleteOnly},
 	}
 
 	return tests
 }
 
+func (s *testDDLSuite) checkDropIdx(c *C, d *ddl, schemaID int64, tableID int64, idxName string, success bool) {
+	checkIdxExist(c, d, schemaID, tableID, idxName, !success)
+}
+
 func (s *testDDLSuite) checkAddIdx(c *C, d *ddl, schemaID int64, tableID int64, idxName string, success bool) {
+	checkIdxExist(c, d, schemaID, tableID, idxName, success)
+}
+
+func checkIdxExist(c *C, d *ddl, schemaID int64, tableID int64, idxName string, expectedExist bool) {
 	changedTable := testGetTable(c, d, schemaID, tableID)
 	var found bool
 	for _, idxInfo := range changedTable.Meta().Indices {
@@ -453,7 +471,7 @@ func (s *testDDLSuite) checkAddIdx(c *C, d *ddl, schemaID int64, tableID int64, 
 			break
 		}
 	}
-	c.Assert(found, Equals, success)
+	c.Assert(found, Equals, expectedExist)
 }
 
 func (s *testDDLSuite) checkAddColumn(c *C, d *ddl, schemaID int64, tableID int64, colName string, success bool) {
@@ -493,6 +511,8 @@ func (s *testDDLSuite) TestCancelJob(c *C) {
 	testCreateSchema(c, testNewContext(d), d, dbInfo)
 	// create a partition table.
 	partitionTblInfo := testTableInfoWithPartition(c, d, "t_partition", 5)
+	// Skip using sessPool. Make sure adding primary key can be successful.
+	partitionTblInfo.Columns[0].Flag |= mysql.NotNullFlag
 	// create table t (c1 int, c2 int, c3 int, c4 int, c5 int);
 	tblInfo := testTableInfo(c, d, "t", 5)
 	ctx := testNewContext(d)
@@ -574,7 +594,7 @@ func (s *testDDLSuite) TestCancelJob(c *C) {
 	updateTest(&tests[0])
 	idxOrigName := "idx"
 	validArgs := []interface{}{false, model.NewCIStr(idxOrigName),
-		[]*ast.IndexColName{{
+		[]*ast.IndexPartSpecification{{
 			Column: &ast.ColumnName{Name: model.NewCIStr("c1")},
 			Length: -1,
 		}}, nil}
@@ -790,6 +810,45 @@ func (s *testDDLSuite) TestCancelJob(c *C) {
 	c.Assert(err, IsNil)
 	c.Assert(dbInfo.Charset, Equals, "utf8mb4")
 	c.Assert(dbInfo.Collate, Equals, "utf8mb4_bin")
+
+	// for adding primary key
+	tblInfo = changedTable.Meta()
+	updateTest(&tests[28])
+	idxOrigName = "primary"
+	validArgs = []interface{}{false, model.NewCIStr(idxOrigName),
+		[]*ast.IndexPartSpecification{{
+			Column: &ast.ColumnName{Name: model.NewCIStr("c1")},
+			Length: -1,
+		}}, nil}
+	cancelState = model.StateNone
+	doDDLJobErrWithSchemaState(ctx, d, c, dbInfo.ID, tblInfo.ID, model.ActionAddPrimaryKey, validArgs, &cancelState)
+	c.Check(errors.ErrorStack(checkErr), Equals, "")
+	s.checkAddIdx(c, d, dbInfo.ID, tblInfo.ID, idxOrigName, false)
+	updateTest(&tests[29])
+	doDDLJobErrWithSchemaState(ctx, d, c, dbInfo.ID, tblInfo.ID, model.ActionAddPrimaryKey, validArgs, &cancelState)
+	c.Check(errors.ErrorStack(checkErr), Equals, "")
+	s.checkAddIdx(c, d, dbInfo.ID, tblInfo.ID, idxOrigName, false)
+	updateTest(&tests[30])
+	doDDLJobErrWithSchemaState(ctx, d, c, dbInfo.ID, tblInfo.ID, model.ActionAddPrimaryKey, validArgs, &cancelState)
+	c.Check(errors.ErrorStack(checkErr), Equals, "")
+	s.checkAddIdx(c, d, dbInfo.ID, tblInfo.ID, idxOrigName, false)
+	updateTest(&tests[31])
+	testCreatePrimaryKey(c, ctx, d, dbInfo, tblInfo, "c1")
+	c.Check(errors.ErrorStack(checkErr), Equals, "")
+	txn, err = ctx.Txn(true)
+	c.Assert(err, IsNil)
+	c.Assert(txn.Commit(context.Background()), IsNil)
+	s.checkAddIdx(c, d, dbInfo.ID, tblInfo.ID, idxOrigName, true)
+
+	// for dropping primary key
+	updateTest(&tests[32])
+	doDDLJobErrWithSchemaState(ctx, d, c, dbInfo.ID, tblInfo.ID, model.ActionDropPrimaryKey, validArgs, &cancelState)
+	c.Check(errors.ErrorStack(checkErr), Equals, "")
+	s.checkDropIdx(c, d, dbInfo.ID, tblInfo.ID, idxOrigName, false)
+	updateTest(&tests[33])
+	testDropIndex(c, ctx, d, dbInfo, tblInfo, idxOrigName)
+	c.Check(errors.ErrorStack(checkErr), Equals, "")
+	s.checkDropIdx(c, d, dbInfo.ID, tblInfo.ID, idxOrigName, true)
 }
 
 func (s *testDDLSuite) TestIgnorableSpec(c *C) {
@@ -889,6 +948,13 @@ func (s *testDDLSuite) TestBuildJobDependence(c *C) {
 		c.Assert(job12.DependencyID, Equals, int64(11))
 		return nil
 	})
+}
+
+func addDDLJob(c *C, d *ddl, job *model.Job) {
+	task := &limitJobTask{job, make(chan error)}
+	d.limitJobCh <- task
+	err := <-task.err
+	c.Assert(err, IsNil)
 }
 
 func (s *testDDLSuite) TestParallelDDL(c *C) {
@@ -1011,27 +1077,27 @@ func (s *testDDLSuite) TestParallelDDL(c *C) {
 		/     11	/	 	2			/		2		/	add index	 /
 	*/
 	job1 := buildCreateIdxJob(dbInfo1, tblInfo1, false, "db1_idx1", "c1")
-	d.addDDLJob(ctx, job1)
+	addDDLJob(c, d, job1)
 	job2 := buildCreateColumnJob(dbInfo1, tblInfo1, "c3", &ast.ColumnPosition{Tp: ast.ColumnPositionNone}, nil)
-	d.addDDLJob(ctx, job2)
+	addDDLJob(c, d, job2)
 	job3 := buildCreateIdxJob(dbInfo1, tblInfo1, false, "db1_idx2", "c3")
-	d.addDDLJob(ctx, job3)
+	addDDLJob(c, d, job3)
 	job4 := buildDropColumnJob(dbInfo1, tblInfo2, "c3")
-	d.addDDLJob(ctx, job4)
+	addDDLJob(c, d, job4)
 	job5 := buildDropIdxJob(dbInfo1, tblInfo1, "db1_idx1")
-	d.addDDLJob(ctx, job5)
+	addDDLJob(c, d, job5)
 	job6 := buildCreateIdxJob(dbInfo1, tblInfo2, false, "db2_idx1", "c2")
-	d.addDDLJob(ctx, job6)
+	addDDLJob(c, d, job6)
 	job7 := buildDropColumnJob(dbInfo2, tblInfo3, "c4")
-	d.addDDLJob(ctx, job7)
+	addDDLJob(c, d, job7)
 	job8 := buildRebaseAutoIDJobJob(dbInfo2, tblInfo3, 1024)
-	d.addDDLJob(ctx, job8)
+	addDDLJob(c, d, job8)
 	job9 := buildCreateIdxJob(dbInfo1, tblInfo1, false, "db1_idx3", "c2")
-	d.addDDLJob(ctx, job9)
+	addDDLJob(c, d, job9)
 	job10 := buildDropSchemaJob(dbInfo2)
-	d.addDDLJob(ctx, job10)
+	addDDLJob(c, d, job10)
 	job11 := buildCreateIdxJob(dbInfo2, tblInfo3, false, "db3_idx1", "c2")
-	d.addDDLJob(ctx, job11)
+	addDDLJob(c, d, job11)
 	// TODO: add rename table job
 
 	// check results.

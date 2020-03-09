@@ -18,8 +18,10 @@ import (
 	"strconv"
 
 	"github.com/pingcap/errors"
+	"github.com/pingcap/log"
 	"github.com/pingcap/parser/mysql"
 	"github.com/pingcap/parser/terror"
+	"go.uber.org/zap"
 )
 
 // RoundMode is the type for round mode.
@@ -248,6 +250,11 @@ func (d *MyDecimal) IsNegative() bool {
 // GetDigitsFrac returns the digitsFrac.
 func (d *MyDecimal) GetDigitsFrac() int8 {
 	return d.digitsFrac
+}
+
+// GetDigitsInt returns the digitsInt.
+func (d *MyDecimal) GetDigitsInt() int8 {
+	return d.digitsInt
 }
 
 // String returns the decimal string representation rounded to resultFrac.
@@ -1781,10 +1788,10 @@ func doAdd(from1, from2, to *MyDecimal) error {
 	stop = 0
 	if wordsInt1 > wordsInt2 {
 		idx1 = wordsInt1 - wordsInt2
-		dec1, dec2 = from1, from2
+		dec1 = from1
 	} else {
 		idx1 = wordsInt2 - wordsInt1
-		dec1, dec2 = from2, from1
+		dec1 = from2
 	}
 	for idx1 > stop {
 		idxTo--
@@ -2286,7 +2293,9 @@ func NewDecFromUint(i uint64) *MyDecimal {
 func NewDecFromFloatForTest(f float64) *MyDecimal {
 	dec := new(MyDecimal)
 	err := dec.FromFloat64(f)
-	terror.Log(errors.Trace(err))
+	if err != nil {
+		log.Panic("encountered error", zap.Error(err), zap.String("DecimalStr", strconv.FormatFloat(f, 'g', -1, 64)))
+	}
 	return dec
 }
 
@@ -2294,7 +2303,9 @@ func NewDecFromFloatForTest(f float64) *MyDecimal {
 func NewDecFromStringForTest(s string) *MyDecimal {
 	dec := new(MyDecimal)
 	err := dec.FromString([]byte(s))
-	terror.Log(errors.Trace(err))
+	if err != nil {
+		log.Panic("encountered error", zap.Error(err), zap.String("DecimalStr", s))
+	}
 	return dec
 }
 

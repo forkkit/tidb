@@ -31,13 +31,18 @@ split-table = true
 # The limit of concurrent executed sessions.
 token-limit = 1000
 
-# Set the memory quota for a query in bytes. Default: 32GB
-mem-quota-query = 34359738368
+# The maximum memory available for a single SQL statement. Default: 1GB
+mem-quota-query = 1073741824
 
-# Set to true to enable use of temporary disk for some executors when mem-quota-query is exceeded.
+# Controls whether to enable the temporary storage for some operators when a single SQL statement exceeds the memory quota specified by mem-quota-query.
 oom-use-tmp-storage = true
 
-# What to do when mem-quota-query is exceeded and can not be spilled over to disk any more.
+# Specifies the temporary storage path for some operators when a single SQL statement exceeds the memory quota specified by mem-quota-query.
+# It defaults to `<TMPDIR>/tidb/tmp-storage` if it is unset.
+# It only takes effect when `oom-use-tmp-storage` is `true`.
+# tmp-storage-path = "/tmp/tidb/tmp-storage"
+
+# Specifies what operation TiDB performs when a single SQL statement exceeds the memory quota specified by mem-quota-query and cannot be spilled over to disk.
 # Valid options: ["log", "cancel"]
 oom-action = "log"
 
@@ -60,6 +65,9 @@ check-mb4-value-in-utf8 = true
 # treat-old-version-utf8-as-utf8mb4 use for upgrade compatibility. Set to true will treat old version table/column UTF8 charset as UTF8MB4.
 treat-old-version-utf8-as-utf8mb4 = true
 
+# max-index-length is used to deal with compatibility issues from v3.0.7 and previous version upgrades. It can only be in [3072, 3072*4].
+max-index-length = 3072
+
 # enable-table-lock is used to control table lock feature. Default is false, indicate the table lock feature is disabled.
 enable-table-lock = false
 
@@ -68,6 +76,34 @@ delay-clean-table-lock = 0
 
 # Maximum number of the splitting region, which is used by the split region statement.
 split-region-max-num = 1000
+
+# enable the TiDB to fetch configs from PD and update itself during runtime.
+# see https://github.com/pingcap/tidb/pull/13660 for more details.
+enable-dynamic-config = true
+
+# alter-primary-key is used to control alter primary key feature. Default is false, indicate the alter primary key feature is disabled.
+# If it is true, we can add the primary key by "alter table", but we may not be able to drop the primary key.
+# In order to support "drop primary key" operation , this flag must be true and the table does not have the pkIsHandle flag.
+alter-primary-key = false
+
+# server-version is used to change the version string of TiDB in the following scenarios:
+# 1. the server version returned by builtin-function `VERSION()`.
+# 2. the server version filled in handshake packets of MySQL Connection Protocol, see https://dev.mysql.com/doc/internals/en/connection-phase-packets.html#packet-Protocol::Handshake for more details.
+# if server-version = "", the default value(original TiDB version string) is used.
+server-version = ""
+
+# repair mode is used to repair the broken table meta in TiKV in extreme cases.
+repair-mode = false
+
+# Repair table list is used to list the tables in repair mode with the format like ["db.table",].
+# In repair mode, repairing table which is not in repair list will get wrong database or wrong table error.
+repair-table-list = []
+
+# The maximum permitted number of simultaneous client connections.
+max-server-connections = 4096
+
+# Whether new collations are enabled, as indicated by its name, this configuration entry take effect ONLY when a TiDB cluster bootstraps for the first time.
+new_collations_enabled_on_first_bootstrap = false
 
 [log]
 # Log level: debug, info, warn, error, fatal.
@@ -81,6 +117,9 @@ format = "text"
 
 # Enable annotating logs with the full stack error message, if not set, it will be defaulted to false.
 # enable-error-stack = false
+
+# Whether to enable slow query log.
+enable-slow-log = true
 
 # Stores slow query log into separated files.
 slow-query-file = "tidb-slow.log"
@@ -194,8 +233,8 @@ bind-info-lease = "3s"
 
 # The limitation of the size in byte for the entries in one transaction.
 # If using TiKV as the storage, the entry represents a key/value pair.
-# WARNING: Do not set the value too large, otherwise it will make a very large impact on the TiKV cluster.
-# Please adjust this configuration carefully.
+# NOTE: If binlog is enabled, this value should be less than 104857600(10M) because this is the maximum size that can be handled by Pumper.
+# If binlog is not enabled, this value should be less than 10737418240(10G).
 txn-total-size-limit = 104857600
 
 [proxy-protocol]
@@ -293,6 +332,11 @@ enable-chunk-rpc = true
 # will be reloaded from the PD.
 region-cache-ttl = 600
 
+# store-limit is used to restrain TiDB from sending request to some stores which is up to the limit.
+# If a store has been up to the limit, it will return error for the successive request in same store.
+# default 0 means shutting off store limit.
+store-limit = 0
+
 [txn-local-latches]
 # Enable local latches for transactions. Enable it when
 # there are lots of conflicts between transactions.
@@ -301,6 +345,7 @@ capacity = 2048000
 
 [binlog]
 # enable to write binlog.
+# NOTE: If binlog is enabled, txn-total-size-limit should be less than 104857600(10M).
 enable = false
 
 # WriteTimeout specifies how long it will wait for writing binlog to pump.
@@ -324,8 +369,28 @@ enable = true
 max-retry-count = 256
 
 [stmt-summary]
+# enable statement summary.
+enable = true
+
 # max number of statements kept in memory.
-max-stmt-count = 100
+max-stmt-count = 200
 
 # max length of displayed normalized sql and sample sql.
 max-sql-length = 4096
+
+# the refresh interval of statement summary, it's counted in seconds.
+refresh-interval = 1800
+
+# the maximum history size of statement summary.
+history-size = 24
+
+# experimental section controls the features that are still experimental: their semantics,
+# interfaces are subject to change, using these features in the production environment is not recommended.
+[experimental]
+# enable column attribute `auto_random` to be defined on the primary key column.
+allow-auto-random = false
+
+# server level isolation read by engines and labels
+[isolation-read]
+# engines means allow the tidb server read data from which types of engines. options: "tikv", "tiflash", "tidb".
+engines = ["tikv", "tiflash", "tidb"]

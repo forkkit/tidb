@@ -168,13 +168,6 @@ func FindFieldNameIdxByColName(names []*types.FieldName, colName string) int {
 }
 
 func (sr *simpleRewriter) rewriteColumn(nodeColName *ast.ColumnNameExpr) (*Column, error) {
-	if sr.names != nil {
-		idx, err := FindFieldName(sr.names, nodeColName.Name)
-		if idx >= 0 && err == nil {
-			return sr.schema.Columns[idx], nil
-		}
-		return nil, errBadField.GenWithStackByArgs(nodeColName.Name.Name.O, "expression")
-	}
 	idx, err := FindFieldName(sr.names, nodeColName.Name)
 	if idx >= 0 && err == nil {
 		return sr.schema.Columns[idx], nil
@@ -432,7 +425,8 @@ func (sr *simpleRewriter) likeToScalarFunc(v *ast.PatternLikeExpr) {
 		return
 	}
 	escapeTp := &types.FieldType{}
-	types.DefaultTypeForValue(int(v.Escape), escapeTp)
+	char, col := sr.ctx.GetSessionVars().GetCharsetInfo()
+	types.DefaultTypeForValue(int(v.Escape), escapeTp, char, col)
 	function := sr.notToExpression(v.Not, ast.Like, &v.Type,
 		expr, pattern, &Constant{Value: types.NewIntDatum(int64(v.Escape)), RetType: escapeTp})
 	sr.push(function)

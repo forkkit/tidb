@@ -189,11 +189,8 @@ func (s *testFieldTypeSuite) TestDefaultTypeForValue(c *C) {
 		{[]byte("abc"), mysql.TypeBlob, 3, UnspecifiedLength, charset.CharsetBin, charset.CharsetBin, mysql.BinaryFlag},
 		{HexLiteral{}, mysql.TypeVarString, 0, 0, charset.CharsetBin, charset.CharsetBin, mysql.BinaryFlag | mysql.UnsignedFlag},
 		{BitLiteral{}, mysql.TypeVarString, 0, 0, charset.CharsetBin, charset.CharsetBin, mysql.BinaryFlag},
-		{Time{Type: mysql.TypeDatetime}, mysql.TypeDatetime, 19, 0, charset.CharsetBin, charset.CharsetBin, mysql.BinaryFlag},
-		{Time{
-			Time: FromDate(2017, 12, 12, 12, 59, 59, 0),
-			Type: mysql.TypeDatetime,
-			Fsp:  3}, mysql.TypeDatetime, 23, 3, charset.CharsetBin, charset.CharsetBin, mysql.BinaryFlag},
+		{NewTime(ZeroCoreTime, mysql.TypeDatetime, DefaultFsp), mysql.TypeDatetime, 19, 0, charset.CharsetBin, charset.CharsetBin, mysql.BinaryFlag},
+		{NewTime(FromDate(2017, 12, 12, 12, 59, 59, 0), mysql.TypeDatetime, 3), mysql.TypeDatetime, 23, 3, charset.CharsetBin, charset.CharsetBin, mysql.BinaryFlag},
 		{Duration{}, mysql.TypeDuration, 8, 0, charset.CharsetBin, charset.CharsetBin, mysql.BinaryFlag},
 		{&MyDecimal{}, mysql.TypeNewDecimal, 1, 0, charset.CharsetBin, charset.CharsetBin, mysql.BinaryFlag},
 		{Enum{Name: "a", Value: 1}, mysql.TypeEnum, 1, UnspecifiedLength, charset.CharsetBin, charset.CharsetBin, mysql.BinaryFlag},
@@ -201,7 +198,7 @@ func (s *testFieldTypeSuite) TestDefaultTypeForValue(c *C) {
 	}
 	for _, tt := range tests {
 		var ft FieldType
-		DefaultTypeForValue(tt.value, &ft)
+		DefaultTypeForValue(tt.value, &ft, mysql.DefaultCharset, mysql.DefaultCollationName)
 		c.Assert(ft.Tp, Equals, tt.tp, Commentf("%v %v", ft.Tp, tt.tp))
 		c.Assert(ft.Flen, Equals, tt.flen, Commentf("%v %v", ft.Flen, tt.flen))
 		c.Assert(ft.Charset, Equals, tt.charset, Commentf("%v %v", ft.Charset, tt.charset))
